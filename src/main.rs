@@ -1,16 +1,15 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, broadcast};
-use tokio::time::{Duration, interval, sleep};
-use tycho_types::cell::{Cell, CellBuilder, HashBytes};
+use rand::RngCore;
+use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::time::{sleep, Duration, interval};
+use tycho_types::cell::{Cell, CellBuilder, CellSlice, HashBytes};
 
 type ValidatorAddress = HashBytes;
 
 #[derive(Clone, Copy, Debug)]
 struct ValidatorBehaviorConfig {
-    response_probability: f32,
     malicious_signature_probability: f32,
     participation_rate: f32,
 }
@@ -18,25 +17,22 @@ struct ValidatorBehaviorConfig {
 impl ValidatorBehaviorConfig {
     fn poor() -> Self {
         Self {
-            response_probability: 0.3,
-            malicious_signature_probability: 0.5,
-            participation_rate: 0.3,
+            malicious_signature_probability: 0.3,
+            participation_rate: 0.1,
         }
     }
 
     fn normal() -> Self {
         Self {
-            response_probability: 0.6,
-            malicious_signature_probability: 0.1,
-            participation_rate: 0.6,
+            malicious_signature_probability: 0.05,
+            participation_rate: 0.2,
         }
     }
 
     fn excellent() -> Self {
         Self {
-            response_probability: 0.9,
             malicious_signature_probability: 0.01,
-            participation_rate: 0.9,
+            participation_rate: 0.3,
         }
     }
 
@@ -260,7 +256,6 @@ impl ValidatorMetrics {
             return "Poor";
         }
 
-        // Теперь оцениваем по комбинации участия и качества
         let participation_rate = self.get_participation_rate();
 
         if participation_rate >= 80.0 && validity_rate >= 95.0 {
@@ -288,14 +283,7 @@ struct BlockProducer {
 impl BlockProducer {
     fn new(total_blocks: usize, block_interval: Duration) -> (Self, broadcast::Receiver<Block>) {
         let (tx, rx) = broadcast::channel(100);
-        (
-            Self {
-                tx,
-                block_interval,
-                total_blocks,
-            },
-            rx,
-        )
+        (Self { tx, block_interval, total_blocks }, rx)
     }
 
     async fn start_producing(self) {
@@ -315,10 +303,7 @@ impl BlockProducer {
             println!("Block producer: Broadcasting block #{}", block.height);
             let _ = self.tx.send(block);
         }
-        println!(
-            "Block producer: Finished producing {} blocks",
-            self.total_blocks
-        );
+        println!("Block producer: Finished producing {} blocks", self.total_blocks);
     }
 }
 
@@ -329,25 +314,13 @@ struct Validator {
     local_stats: Arc<RwLock<HashMap<ValidatorAddress, ValidatorStats>>>,
     blocks_to_track: usize,
     validator_set: Arc<RwLock<HashMap<ValidatorAddress, Arc<Validator>>>>,
-    stats_sender: Arc<
-        Mutex<
-            Option<
-                tokio::sync::mpsc::Sender<(
-                    ValidatorAddress,
-                    HashMap<ValidatorAddress, ValidatorStats>,
-                )>,
-            >,
-        >,
-    >,
+    stats_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<(ValidatorAddress, HashMap<ValidatorAddress, ValidatorStats>)>>>>,
     behavior_score: f32,
     behavior_config: ValidatorBehaviorConfig,
 }
 
 impl Validator {
-    fn new(
-        blocks_to_track: usize,
-        validator_set: Arc<RwLock<HashMap<ValidatorAddress, Arc<Validator>>>>,
-    ) -> Self {
+    fn new(blocks_to_track: usize, validator_set: Arc<RwLock<HashMap<ValidatorAddress, Arc<Validator>>>>) -> Self {
         let mut rng = rand::rng();
         let mut secret_key_bytes = [0u8; 32];
         rng.fill_bytes(&mut secret_key_bytes);
@@ -374,13 +347,7 @@ impl Validator {
         }
     }
 
-    async fn set_stats_sender(
-        &self,
-        sender: tokio::sync::mpsc::Sender<(
-            ValidatorAddress,
-            HashMap<ValidatorAddress, ValidatorStats>,
-        )>,
-    ) {
+    async fn set_stats_sender(&self, sender: tokio::sync::mpsc::Sender<(ValidatorAddress, HashMap<ValidatorAddress, ValidatorStats>)>) {
         *self.stats_sender.lock().await = Some(sender);
     }
 
@@ -398,16 +365,8 @@ impl Validator {
         }
     }
 
-    async fn request_signature(
-        &self,
-        validator: &Arc<Validator>,
-        block: &Block,
-    ) -> Option<BlockSignature> {
+    async fn request_signature(&self, validator: &Arc<Validator>, block: &Block) -> Option<BlockSignature> {
         if !validator.behavior_config.should_participate() {
-            return None;
-        }
-
-        if rand::random::<f32>() >= validator.behavior_config.response_probability {
             return None;
         }
 
@@ -419,12 +378,7 @@ impl Validator {
         })
     }
 
-    fn verify_signature(
-        &self,
-        block: &Block,
-        sig: &BlockSignature,
-        verifying_key: &VerifyingKey,
-    ) -> bool {
+    fn verify_signature(&self, block: &Block, sig: &BlockSignature, verifying_key: &VerifyingKey) -> bool {
         let message = [&block.height.to_le_bytes()[..], &block.hash[..]].concat();
         verifying_key.verify(&message, &sig.signature).is_ok()
     }
@@ -435,10 +389,7 @@ impl Validator {
         drop(registry);
 
         let threshold = (all_validators.len() * 2 / 3) + 1;
-        println!(
-            "  Validator {:02x}{:02x}: Collecting signatures for block #{}",
-            self.address[0], self.address[1], block.height
-        );
+        println!("  Validator {:02x}{:02x}: Collecting signatures for block #{}", self.address[0], self.address[1], block.height);
 
         let mut validator_indices: Vec<usize> = (0..all_validators.len()).collect();
         use rand::seq::SliceRandom;
@@ -462,15 +413,11 @@ impl Validator {
                 }
 
                 let signature = self.sign_block(block).await;
-                let is_valid = self.verify_signature(
-                    block,
-                    &BlockSignature {
-                        validator: self.address,
-                        signature: signature.clone(),
-                        is_valid: false,
-                    },
-                    &self.verifying_key,
-                );
+                let is_valid = self.verify_signature(block, &BlockSignature {
+                    validator: self.address,
+                    signature: signature.clone(),
+                    is_valid: false,
+                }, &self.verifying_key);
 
                 if is_valid {
                     valid_count += 1;
@@ -478,48 +425,31 @@ impl Validator {
                     invalid_count += 1;
                     println!("    ⚠️  Self-signed signature is INVALID!");
                 }
-                signatures.push(BlockSignature {
-                    validator: self.address,
-                    signature,
-                    is_valid,
-                });
+                signatures.push(BlockSignature { validator: self.address, signature, is_valid });
             } else if let Some(mut sig) = self.request_signature(validator, block).await {
                 sig.is_valid = self.verify_signature(block, &sig, &validator.verifying_key);
                 if sig.is_valid {
                     valid_count += 1;
                 } else {
                     invalid_count += 1;
-                    println!(
-                        "    ✗ Invalid signature from {:02x}{:02x}",
-                        validator.address[0], validator.address[1]
-                    );
+                    println!("    ✗ Invalid signature from {:02x}{:02x}", validator.address[0], validator.address[1]);
                 }
                 signatures.push(sig);
             }
         }
 
-        println!(
-            "  Validator {:02x}{:02x}: Collected {}/{} signatures (✓{} valid, ✗{} invalid)",
-            self.address[0],
-            self.address[1],
-            signatures.len(),
-            threshold,
-            valid_count,
-            invalid_count
-        );
+        println!("  Validator {:02x}{:02x}: Collected {}/{} signatures (✓{} valid, ✗{} invalid)",
+                 self.address[0], self.address[1], signatures.len(), threshold, valid_count, invalid_count);
         signatures
     }
 
     async fn update_local_stats(&self, block_idx: usize, signatures: &[BlockSignature]) {
         let mut stats = self.local_stats.write().await;
         let registry = self.validator_set.read().await;
-        let signature_map: HashMap<ValidatorAddress, &BlockSignature> =
-            signatures.iter().map(|s| (s.validator, s)).collect();
+        let signature_map: HashMap<ValidatorAddress, &BlockSignature> = signatures.iter().map(|s| (s.validator, s)).collect();
 
         for validator_addr in registry.keys() {
-            let validator_stats = stats
-                .entry(*validator_addr)
-                .or_insert_with(|| ValidatorStats::new(self.blocks_to_track));
+            let validator_stats = stats.entry(*validator_addr).or_insert_with(|| ValidatorStats::new(self.blocks_to_track));
             let participation = if let Some(sig) = signature_map.get(validator_addr) {
                 if sig.is_valid {
                     BlockParticipation::ValidSignature
@@ -537,37 +467,27 @@ impl Validator {
         let stats = self.local_stats.read().await.clone();
         if let Some(sender) = self.stats_sender.lock().await.as_ref() {
             let _ = sender.send((self.address, stats)).await;
-            println!(
-                "  Validator {:02x}{:02x}: Sent statistics to slasher for block {}",
-                self.address[0], self.address[1], block_id
-            );
+            println!("  Validator {:02x}{:02x}: Sent statistics to slasher for block {}", self.address[0], self.address[1], block_id);
         }
     }
 
     async fn run(self: Arc<Self>, mut block_rx: broadcast::Receiver<Block>) {
-        let mut block_count = 0;
         loop {
             match block_rx.recv().await {
                 Ok(block) => {
                     let block_idx = block.height as usize;
                     let signatures = self.collect_signatures(&block).await;
                     self.update_local_stats(block_idx, &signatures).await;
-                    block_count += 1;
-                    if block_count % 5 == 0 || block_idx == self.blocks_to_track - 1 {
+
+                    if block_idx == self.blocks_to_track - 1 {
                         self.send_stats_to_slasher(block_idx).await;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    println!(
-                        "  Validator {:02x}{:02x}: Lagged by {} blocks",
-                        self.address[0], self.address[1], n
-                    );
+                    println!("  Validator {:02x}{:02x}: Lagged by {} blocks", self.address[0], self.address[1], n);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    println!(
-                        "  Validator {:02x}{:02x}: Block producer finished",
-                        self.address[0], self.address[1]
-                    );
+                    println!("  Validator {:02x}{:02x}: Block producer finished", self.address[0], self.address[1]);
                     break;
                 }
             }
@@ -578,24 +498,14 @@ impl Validator {
 
 struct Slasher {
     validator_set: Vec<ValidatorAddress>,
-    aggregated_stats:
-        Arc<Mutex<HashMap<ValidatorAddress, Vec<(ValidatorAddress, ValidatorStats)>>>>,
+    aggregated_stats: Arc<Mutex<HashMap<ValidatorAddress, Vec<(ValidatorAddress, ValidatorStats)>>>>,
     blocks_to_track: usize,
-    stats_receiver:
-        tokio::sync::mpsc::Receiver<(ValidatorAddress, HashMap<ValidatorAddress, ValidatorStats>)>,
+    stats_receiver: tokio::sync::mpsc::Receiver<(ValidatorAddress, HashMap<ValidatorAddress, ValidatorStats>)>,
     scoring_config: ScoringConfig,
 }
 
 impl Slasher {
-    fn new(
-        validator_set: Vec<ValidatorAddress>,
-        blocks_to_track: usize,
-        stats_receiver: tokio::sync::mpsc::Receiver<(
-            ValidatorAddress,
-            HashMap<ValidatorAddress, ValidatorStats>,
-        )>,
-        scoring_config: ScoringConfig,
-    ) -> Self {
+    fn new(validator_set: Vec<ValidatorAddress>, blocks_to_track: usize, stats_receiver: tokio::sync::mpsc::Receiver<(ValidatorAddress, HashMap<ValidatorAddress, ValidatorStats>)>, scoring_config: ScoringConfig) -> Self {
         Self {
             validator_set,
             aggregated_stats: Arc::new(Mutex::new(HashMap::new())),
@@ -605,37 +515,24 @@ impl Slasher {
         }
     }
 
-    async fn receive_stats(
-        &mut self,
-        reporter: ValidatorAddress,
-        stats: HashMap<ValidatorAddress, ValidatorStats>,
-    ) {
+    async fn receive_stats(&mut self, reporter: ValidatorAddress, stats: HashMap<ValidatorAddress, ValidatorStats>) {
         let mut aggregated = self.aggregated_stats.lock().await;
         for (validator_addr, validator_stats) in stats {
-            aggregated
-                .entry(validator_addr)
-                .or_insert_with(Vec::new)
-                .push((reporter, validator_stats));
+            aggregated.entry(validator_addr).or_insert_with(Vec::new).push((reporter, validator_stats));
         }
     }
 
     async fn run(mut self) {
         println!("\nSlasher: Started listening for validator statistics...");
         while let Some((reporter, stats)) = self.stats_receiver.recv().await {
-            println!(
-                "  Slasher: Received stats from validator {:02x}{:02x}",
-                reporter[0], reporter[1]
-            );
+            println!("  Slasher: Received stats from validator {:02x}{:02x}", reporter[0], reporter[1]);
             self.receive_stats(reporter, stats).await;
         }
         println!("\nSlasher: All statistics received, generating report...");
         self.print_aggregated_stats().await;
     }
 
-    async fn aggregate_validator_stats(
-        &self,
-        validator: ValidatorAddress,
-    ) -> Option<ValidatorStats> {
+    async fn aggregate_validator_stats(&self, validator: ValidatorAddress) -> Option<ValidatorStats> {
         let aggregated = self.aggregated_stats.lock().await;
         let reports = aggregated.get(&validator)?;
         if reports.is_empty() {
@@ -643,12 +540,7 @@ impl Slasher {
         }
 
         let mut final_stats = ValidatorStats::new(self.blocks_to_track);
-        println!(
-            "\n  Aggregating stats for validator {:02x}{:02x} from {} reports:",
-            validator[0],
-            validator[1],
-            reports.len()
-        );
+        println!("\n  Aggregating stats for validator {:02x}{:02x} from {} reports:", validator[0], validator[1], reports.len());
 
         for block_idx in 0..self.blocks_to_track {
             let mut valid_sig_votes = 0;
@@ -660,10 +552,7 @@ impl Slasher {
                     BlockParticipation::ValidSignature => valid_sig_votes += 1,
                     BlockParticipation::InvalidSignature => {
                         invalid_sig_votes += 1;
-                        println!(
-                            "    Block {}: Reporter {:02x}{:02x} saw INVALID signature",
-                            block_idx, reporter[0], reporter[1]
-                        );
+                        println!("    Block {}: Reporter {:02x}{:02x} saw INVALID signature", block_idx, reporter[0], reporter[1]);
                     }
                     BlockParticipation::NotParticipated => not_participated_votes += 1,
                 }
@@ -687,15 +576,8 @@ impl Slasher {
                 }
             };
 
-            println!(
-                "    Block {}: Valid={}, Invalid={}, NotPart={} | Participated={} → Decision: {:?}",
-                block_idx,
-                valid_sig_votes,
-                invalid_sig_votes,
-                not_participated_votes,
-                participated_votes,
-                participation
-            );
+            println!("    Block {}: Valid={}, Invalid={}, NotPart={} | Participated={} → Decision: {:?}",
+                     block_idx, valid_sig_votes, invalid_sig_votes, not_participated_votes, participated_votes, participation);
             final_stats.update_block_stats(block_idx, participation);
         }
         Some(final_stats)
@@ -720,81 +602,39 @@ impl Slasher {
 
         let metrics_list = self.calculate_all_metrics().await;
 
-        println!("\n VALIDATOR RANKINGS:");
+        println!("\n📊 VALIDATOR RANKINGS:");
         println!("┌──────────────┬───────┬──────────┬────────┬─────────┬─────────┬──────────────┐");
         println!("│  Validator   │ Score │ Rating   │ Part.% │ Valid % │ Invalid │   Missed     │");
         println!("├──────────────┼───────┼──────────┼────────┼─────────┼─────────┼──────────────┤");
 
         for (rank, (validator, metrics)) in metrics_list.iter().enumerate() {
-            let validator_short = format!(
-                "{:02x}{:02x}...{:02x}{:02x}",
-                validator[0], validator[1], validator[30], validator[31]
-            );
-            println!(
-                "│ #{:2} {}│  {:4} │ {:8} │ {:5.1}% │  {:5.1}% │   {:3}   │     {:3}      │",
-                rank + 1,
-                validator_short,
-                metrics.score,
-                metrics.get_rating(),
-                metrics.get_participation_rate(),
-                metrics.get_validity_rate(),
-                metrics.invalid_signatures,
-                metrics.missed_blocks
-            );
+            let validator_short = format!("{:02x}{:02x}...{:02x}{:02x}", validator[0], validator[1], validator[30], validator[31]);
+            println!("│ #{:2} {}│  {:4} │ {:8} │ {:5.1}% │  {:5.1}% │   {:3}   │     {:3}      │",
+                     rank + 1, validator_short, metrics.score, metrics.get_rating(),
+                     metrics.get_participation_rate(), metrics.get_validity_rate(),
+                     metrics.invalid_signatures, metrics.missed_blocks);
         }
         println!("└──────────────┴───────┴──────────┴────────┴─────────┴─────────┴──────────────┘");
 
         let excellent_count = metrics_list.iter().filter(|(_, m)| m.score >= 20).count();
-        let good_count = metrics_list
-            .iter()
-            .filter(|(_, m)| m.score >= 10 && m.score < 20)
-            .count();
-        let average_count = metrics_list
-            .iter()
-            .filter(|(_, m)| m.score >= 0 && m.score < 10)
-            .count();
-        let poor_count = metrics_list
-            .iter()
-            .filter(|(_, m)| m.score >= -10 && m.score < 0)
-            .count();
+        let good_count = metrics_list.iter().filter(|(_, m)| m.score >= 10 && m.score < 20).count();
+        let average_count = metrics_list.iter().filter(|(_, m)| m.score >= 0 && m.score < 10).count();
+        let poor_count = metrics_list.iter().filter(|(_, m)| m.score >= -10 && m.score < 0).count();
         let critical_count = metrics_list.iter().filter(|(_, m)| m.score < -10).count();
 
-        println!("\n PERFORMANCE DISTRIBUTION:");
+        println!("\n📈 PERFORMANCE DISTRIBUTION:");
         println!("┌────────────────────────────────────────────┐");
-        println!(
-            "│ ⭐⭐⭐ Excellent (≥20):  {:2} validators      │",
-            excellent_count
-        );
-        println!(
-            "│ ⭐⭐  Good (10-19):     {:2} validators      │",
-            good_count
-        );
-        println!(
-            "│ ⭐   Average (0-9):    {:2} validators      │",
-            average_count
-        );
-        println!(
-            "│ ⚠️   Poor (-10 to -1): {:2} validators      │",
-            poor_count
-        );
-        println!(
-            "│ ❌   Critical (<-10):  {:2} validators      │",
-            critical_count
-        );
+        println!("│ ⭐⭐⭐ Excellent (≥20):  {:2} validators      │", excellent_count);
+        println!("│ ⭐⭐  Good (10-19):     {:2} validators      │", good_count);
+        println!("│ ⭐   Average (0-9):    {:2} validators      │", average_count);
+        println!("│ ⚠️   Poor (-10 to -1): {:2} validators      │", poor_count);
+        println!("│ ❌   Critical (<-10):  {:2} validators      │", critical_count);
         println!("└────────────────────────────────────────────┘");
 
         let total_score: i32 = metrics_list.iter().map(|(_, m)| m.score).sum();
-        let avg_score = if !metrics_list.is_empty() {
-            total_score as f32 / metrics_list.len() as f32
-        } else {
-            0.0
-        };
+        let avg_score = if !metrics_list.is_empty() { total_score as f32 / metrics_list.len() as f32 } else { 0.0 };
         let total_participation: f32 = if !metrics_list.is_empty() {
-            metrics_list
-                .iter()
-                .map(|(_, m)| m.get_participation_rate())
-                .sum::<f32>()
-                / metrics_list.len() as f32
+            metrics_list.iter().map(|(_, m)| m.get_participation_rate()).sum::<f32>() / metrics_list.len() as f32
         } else {
             0.0
         };
@@ -802,20 +642,11 @@ impl Slasher {
         println!("\n🌐 NETWORK HEALTH:");
         println!("┌────────────────────────────────────────────┐");
         println!("│ Average Score:         {:6.1}              │", avg_score);
-        println!(
-            "│ Network Participation: {:6.1}%             │",
-            total_participation
-        );
-        println!(
-            "│ Network Status:        {}          │",
-            if avg_score >= 15.0 {
-                "✅ Healthy    "
-            } else if avg_score >= 5.0 {
-                "⚠️  Degraded   "
-            } else {
-                "❌ Critical   "
-            }
-        );
+        println!("│ Network Participation: {:6.1}%             │", total_participation);
+        println!("│ Network Status:        {}          │",
+                 if avg_score >= 15.0 { "✅ Healthy    " }
+                 else if avg_score >= 5.0 { "⚠️  Degraded   " }
+                 else { "❌ Critical   " });
         println!("└────────────────────────────────────────────┘");
     }
 }
@@ -838,18 +669,9 @@ async fn simulate_slashing_system() {
     println!("  • Blocks to process: {}", NUM_BLOCKS);
     println!("  • Block interval: {}ms", BLOCK_INTERVAL_MS);
     println!("\nSCORING CONFIGURATION:");
-    println!(
-        "  • Valid signature: {:+} points",
-        scoring_config.valid_signature_score
-    );
-    println!(
-        "  • Invalid signature: {:+} points",
-        scoring_config.invalid_signature_penalty
-    );
-    println!(
-        "  • Missed block: {:+} points",
-        scoring_config.missed_block_penalty
-    );
+    println!("  • Valid signature: {:+} points", scoring_config.valid_signature_score);
+    println!("  • Invalid signature: {:+} points", scoring_config.invalid_signature_penalty);
+    println!("  • Missed block: {:+} points", scoring_config.missed_block_penalty);
 
     let validator_set = Arc::new(RwLock::new(HashMap::new()));
     let (stats_tx, stats_rx) = tokio::sync::mpsc::channel(100);
@@ -877,9 +699,9 @@ async fn simulate_slashing_system() {
     let mut excellent_count = 0;
 
     println!("\nVALIDATOR BEHAVIOR PROFILES:");
-    println!("┌──────────────┬──────────┬──────────────┬─────────────────────┬──────────────┐");
-    println!("│  Validator   │  Type    │  Response %  │  Malicious Sig %    │  Particip %  │");
-    println!("├──────────────┼──────────┼──────────────┼─────────────────────┼──────────────┤");
+    println!("┌──────────────┬──────────┬──────────────┬─────────────────────┐");
+    println!("│  Validator   │  Type    │  Particip %  │  Malicious Sig %    │");
+    println!("├──────────────┼──────────┼──────────────┼─────────────────────┤");
 
     for validator in &validators {
         let validator_type = if validator.behavior_score < 0.2 {
@@ -893,37 +715,18 @@ async fn simulate_slashing_system() {
             "Excellent"
         };
 
-        let validator_short = format!(
-            "{:02x}{:02x}...{:02x}{:02x}",
-            validator.address[0],
-            validator.address[1],
-            validator.address[30],
-            validator.address[31]
-        );
-        println!(
-            "│ {} │ {:8} │    {:5.1}%    │       {:5.1}%        │   {:5.1}%    │",
-            validator_short,
-            validator_type,
-            validator.behavior_config.response_probability * 100.0,
-            validator.behavior_config.malicious_signature_probability * 100.0,
-            validator.behavior_config.participation_rate * 100.0
-        );
+        let validator_short = format!("{:02x}{:02x}...{:02x}{:02x}", validator.address[0], validator.address[1], validator.address[30], validator.address[31]);
+        println!("│ {} │ {:8} │   {:5.1}%    │       {:5.1}%        │",
+                 validator_short, validator_type,
+                 validator.behavior_config.participation_rate * 100.0,
+                 validator.behavior_config.malicious_signature_probability * 100.0);
     }
-    println!("└──────────────┴──────────┴──────────────┴─────────────────────┴──────────────┘");
+    println!("└──────────────┴──────────┴──────────────┴─────────────────────┘");
 
     println!("\nVALIDATOR DISTRIBUTION:");
-    println!(
-        "  • Poor performers: {} (response ~50%, malicious ~30%, participation ~60%)",
-        poor_count
-    );
-    println!(
-        "  • Normal performers: {} (response ~90%, malicious ~5%, participation ~95%)",
-        normal_count
-    );
-    println!(
-        "  • Excellent performers: {} (response ~98%, malicious ~1%, participation ~99%)",
-        excellent_count
-    );
+    println!("  • Poor performers: {} (participation ~10%, malicious ~30%)", poor_count);
+    println!("  • Normal performers: {} (participation ~20%, malicious ~5%)", normal_count);
+    println!("  • Excellent performers: {} (participation ~30%, malicious ~1%)", excellent_count);
 
     let (producer, _) = BlockProducer::new(NUM_BLOCKS, Duration::from_millis(BLOCK_INTERVAL_MS));
     let slasher = Slasher::new(validator_addresses, NUM_BLOCKS, stats_rx, scoring_config);
