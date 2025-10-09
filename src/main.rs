@@ -4,12 +4,16 @@ use std::sync::Arc;
 use rand::RngCore;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{sleep, Duration, interval};
-use tycho_types::cell::{Cell, CellBuilder, HashBytes};
+use tycho_types::cell::{Cell, CellBuilder, HashBytes, Store, Load, CellContext, CellSlice};
+use tycho_types::error::Error;
+use tycho_types::prelude::Dict;
 
 type ValidatorAddress = HashBytes;
 
 const FIXED_POINT_SHIFT: u32 = 16;
 const FIXED_POINT_ONE: u32 = 1 << FIXED_POINT_SHIFT;
+
+const MAX_BLOCK_WINDOW: u8 = 25;
 
 #[derive(Clone, Copy, Debug)]
 struct ValidatorBehaviorConfig {
@@ -27,10 +31,10 @@ impl ValidatorBehaviorConfig {
         }
     }
 
-    fn should_participate(&self) -> bool {
-        let random_value = rand::random::<u32>() % FIXED_POINT_ONE;
-        random_value < self.participation_rate
-    }
+    // fn should_participate(&self) -> bool {
+    //     let random_value = rand::random::<u32>() % FIXED_POINT_ONE;
+    //     random_value < self.participation_rate
+    // }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -93,13 +97,13 @@ impl BlockParticipation {
         }
     }
 
-    fn from_bits(participated: bool, sig_valid: bool, sig_invalid_or_missing: bool) -> Self {
-        match (participated, sig_valid, sig_invalid_or_missing) {
-            (true, true, _) => Self::ValidSignature,
-            (true, false, true) => Self::InvalidSignature,
-            _ => Self::NotParticipated,
-        }
-    }
+    // fn from_bits(participated: bool, sig_valid: bool, sig_invalid_or_missing: bool) -> Self {
+    //     match (participated, sig_valid, sig_invalid_or_missing) {
+    //         (true, true, _) => Self::ValidSignature,
+    //         (true, false, true) => Self::InvalidSignature,
+    //         _ => Self::NotParticipated,
+    //     }
+    // }
 }
 
 #[derive(Clone, Debug)]
@@ -117,30 +121,94 @@ struct BlockSignature {
 
 #[derive(Clone, Debug)]
 struct ValidatorStats {
-    blocks_count: usize,
+    blocks_count: u8,
     cell: Cell,
 }
 
+#[derive(Clone, Debug)]
+pub struct ValidatorInfo {
+    start_block_seqno: u32,
+    block_mask: Vec<bool>,
+    signatures: Vec<ValidatorSignatures>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ValidatorSignatures {
+    id: u32,
+    is_valid: bool,
+}
+
+impl Store for ValidatorInfo {
+    fn store_into(&self, builder: &mut CellBuilder, context: &dyn CellContext) -> Result<(), Error> {
+        builder.store_u32(self.start_block_seqno)?;
+        if self.block_mask.len() > MAX_BLOCK_WINDOW as usize {
+            return Err(Error::InvalidData);
+        }
+        for i in self.block_mask.iter() {
+            builder.store_bit(*i)?;
+        }
+
+        let mut val_info = Dict::<u32, bool>::new();
+        for i in self.signatures.iter() {
+            val_info.set(i.id, i.is_valid)?;
+        }
+        val_info.store_into(builder, context)?;
+
+        Ok(())
+    }
+}
+
+impl<'a> Load<'a> for ValidatorInfo {
+    fn load_from(slice: &mut CellSlice<'a>) -> Result<Self, Error> {
+        let start_block_seqno = slice.load_u32()?;
+        
+        let mut block_mask = Vec::with_capacity(MAX_BLOCK_WINDOW as usize);
+        for _ in 0..MAX_BLOCK_WINDOW {
+            let bit = slice.load_bit()?;
+            block_mask.push(bit);
+        }
+        
+        let mut signatures = Vec::with_capacity(MAX_BLOCK_WINDOW as usize);
+        let dict = Dict::<u32, bool>::load_from(slice)?;
+        for i in dict.iter() {
+            let (key, value) = i?;
+            signatures.push(ValidatorSignatures {
+                id: key,
+                is_valid: value,
+            });
+        }
+        
+        Ok(ValidatorInfo {
+            start_block_seqno,
+            block_mask,
+            signatures
+        })
+    }
+}
+
+
 impl ValidatorStats {
-    fn new(blocks_count: usize) -> Self {
+    fn new(start_block: u32, blocks_count: usize) -> anyhow::Result<Self> {
         let total_bits = blocks_count * 3;
         let mut builder = CellBuilder::new();
+        let _ = builder.store_u32(start_block)?;
         for _ in 0..total_bits {
-            builder.store_bit(false).unwrap();
+            builder.store_bit(false)?;
         }
-        Self {
-            blocks_count,
-            cell: builder.build().unwrap(),
-        }
+        
+        Ok(Self {
+            blocks_count: blocks_count as u8,
+            cell: builder.build()?,
+        })
     }
 
     fn update_block_stats(&mut self, block_idx: usize, participation: BlockParticipation) {
-        if block_idx >= self.blocks_count {
+        if block_idx >= self.blocks_count as usize {
             return;
         }
 
         let total_bits = self.blocks_count * 3;
-        let mut current_bits = Vec::with_capacity(total_bits);
+        let mut current_bits = Vec::with_capacity(total_bits as usize);
         let mut slice = self.cell.as_slice().unwrap();
         for _ in 0..total_bits {
             current_bits.push(slice.load_bit().unwrap_or(false));
@@ -162,30 +230,30 @@ impl ValidatorStats {
         self.cell = builder.build().unwrap();
     }
 
-    fn get_block_stats(&self, block_idx: usize) -> BlockParticipation {
-        if block_idx >= self.blocks_count {
-            return BlockParticipation::NotParticipated;
-        }
-
-        let mut slice = self.cell.as_slice().unwrap();
-        for _ in 0..block_idx {
-            let _ = slice.load_bit();
-        }
-        let participated = slice.load_bit().unwrap_or(false);
-
-        for _ in (block_idx + 1)..self.blocks_count {
-            let _ = slice.load_bit();
-        }
-        for _ in 0..block_idx {
-            let _ = slice.load_bit();
-            let _ = slice.load_bit();
-        }
-
-        let sig_valid = slice.load_bit().unwrap_or(false);
-        let sig_invalid_or_missing = slice.load_bit().unwrap_or(false);
-
-        BlockParticipation::from_bits(participated, sig_valid, sig_invalid_or_missing)
-    }
+    // fn get_block_stats(&self, block_idx: usize) -> BlockParticipation {
+    //     if block_idx >= self.blocks_count {
+    //         return BlockParticipation::NotParticipated;
+    //     }
+    //
+    //     let mut slice = self.cell.as_slice().unwrap();
+    //     for _ in 0..block_idx {
+    //         let _ = slice.load_bit();
+    //     }
+    //     let participated = slice.load_bit().unwrap_or(false);
+    //
+    //     for _ in (block_idx + 1)..self.blocks_count {
+    //         let _ = slice.load_bit();
+    //     }
+    //     for _ in 0..block_idx {
+    //         let _ = slice.load_bit();
+    //         let _ = slice.load_bit();
+    //     }
+    //
+    //     let sig_valid = slice.load_bit().unwrap_or(false);
+    //     let sig_invalid_or_missing = slice.load_bit().unwrap_or(false);
+    //
+    //     BlockParticipation::from_bits(participated, sig_valid, sig_invalid_or_missing)
+    // }
 }
 
 
@@ -393,7 +461,7 @@ impl Validator {
             match block_rx.recv().await {
                 Ok(block) => {
                     let block_idx = block.seqno as usize;
-                    let signatures = self.collect_signatures(&block).await;
+                    let signaturesя = self.collect_signatures(&block).await;
                     self.update_local_stats(block_idx, &signatures).await;
 
                     if block_idx == self.blocks_to_track - 1 {
