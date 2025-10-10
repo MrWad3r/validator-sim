@@ -1,19 +1,22 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::collections::HashMap;
+use std::ops::{Div, Mul};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32};
+use anyhow::Result;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{sleep, Duration, interval};
 use tycho_types::cell::{Cell, CellBuilder, HashBytes, Store, Load, CellContext, CellSlice};
-use tycho_types::error::Error;
-use tycho_types::prelude::Dict;
+use tycho_types::prelude::{CellFamily, Dict};
+
 
 type ValidatorAddress = HashBytes;
 
 const FIXED_POINT_SHIFT: u32 = 16;
 const FIXED_POINT_ONE: u32 = 1 << FIXED_POINT_SHIFT;
 
-const MAX_BLOCK_WINDOW: u8 = 25;
+const BLOCK_WINDOW: u8 = 100;
 
 #[derive(Clone, Copy, Debug)]
 struct ValidatorBehaviorConfig {
@@ -30,11 +33,6 @@ impl ValidatorBehaviorConfig {
             malicious_reporter,
         }
     }
-
-    // fn should_participate(&self) -> bool {
-    //     let random_value = rand::random::<u32>() % FIXED_POINT_ONE;
-    //     random_value < self.participation_rate
-    // }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -89,21 +87,22 @@ enum BlockParticipation {
 }
 
 impl BlockParticipation {
-    fn to_bits(self) -> (bool, bool, bool) {
+    fn to_bits(self) -> (bool, bool) {
         match self {
-            Self::ValidSignature => (true, true, false),
-            Self::InvalidSignature => (true, false, true),
-            Self::NotParticipated => (false, false, true),
+            Self::ValidSignature => (true, false),
+            Self::InvalidSignature => (false, true),
+            Self::NotParticipated => (false, false),
         }
     }
 
-    // fn from_bits(participated: bool, sig_valid: bool, sig_invalid_or_missing: bool) -> Self {
-    //     match (participated, sig_valid, sig_invalid_or_missing) {
-    //         (true, true, _) => Self::ValidSignature,
-    //         (true, false, true) => Self::InvalidSignature,
-    //         _ => Self::NotParticipated,
-    //     }
-    // }
+    fn from_bits(valid: bool, invalid: bool) -> Self {
+        match (valid, invalid) {
+            (true, false) => Self::ValidSignature,
+            (false, true) => Self::InvalidSignature,
+            (false, false) => Self::NotParticipated,
+            _ => panic!()
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -119,143 +118,139 @@ struct BlockSignature {
     is_valid: bool,
 }
 
-#[derive(Clone, Debug)]
-struct ValidatorStats {
-    blocks_count: u8,
-    cell: Cell,
-}
 
 #[derive(Clone, Debug)]
-pub struct ValidatorInfo {
-    start_block_seqno: u32,
-    block_mask: Vec<bool>,
-    signatures: Vec<ValidatorSignatures>,
+struct ValidatorSignatureData {
+    signatures: Vec<BlockParticipation>,
 }
 
-#[derive(Clone, Debug)]
-pub struct ValidatorSignatures {
-    id: u32,
-    is_valid: bool,
-}
+impl Store for ValidatorSignatureData {
+    fn store_into(&self, builder: &mut CellBuilder, _context: &dyn CellContext) -> Result<(), tycho_types::error::Error> {
+        let count = self.signatures.len().min(BLOCK_WINDOW as usize);
 
-impl Store for ValidatorInfo {
-    fn store_into(&self, builder: &mut CellBuilder, context: &dyn CellContext) -> Result<(), Error> {
-        builder.store_u32(self.start_block_seqno)?;
-        if self.block_mask.len() > MAX_BLOCK_WINDOW as usize {
-            return Err(Error::InvalidData);
-        }
-        for i in self.block_mask.iter() {
-            builder.store_bit(*i)?;
+        for i in 0..count {
+            let (valid, invalid) = self.signatures[i].to_bits();
+            builder.store_bit(valid)?;
+            builder.store_bit(invalid)?;
         }
 
-        let mut val_info = Dict::<u32, bool>::new();
-        for i in self.signatures.iter() {
-            val_info.set(i.id, i.is_valid)?;
+        for _ in count..BLOCK_WINDOW as usize {
+            builder.store_bit(false)?;
+            builder.store_bit(false)?;
         }
-        val_info.store_into(builder, context)?;
 
         Ok(())
     }
 }
 
-impl<'a> Load<'a> for ValidatorInfo {
-    fn load_from(slice: &mut CellSlice<'a>) -> Result<Self, Error> {
-        let start_block_seqno = slice.load_u32()?;
-        
-        let mut block_mask = Vec::with_capacity(MAX_BLOCK_WINDOW as usize);
-        for _ in 0..MAX_BLOCK_WINDOW {
-            let bit = slice.load_bit()?;
-            block_mask.push(bit);
+impl<'a> Load<'a> for ValidatorSignatureData {
+    fn load_from(slice: &mut CellSlice<'a>) -> Result<Self, tycho_types::error::Error> {
+        let mut signatures = Vec::with_capacity(BLOCK_WINDOW as usize);
+
+        for _ in 0..BLOCK_WINDOW {
+            let valid = slice.load_bit()?;
+            let invalid = slice.load_bit()?;
+            signatures.push(BlockParticipation::from_bits(valid, invalid));
         }
-        
-        let mut signatures = Vec::with_capacity(MAX_BLOCK_WINDOW as usize);
-        let dict = Dict::<u32, bool>::load_from(slice)?;
-        for i in dict.iter() {
-            let (key, value) = i?;
-            signatures.push(ValidatorSignatures {
-                id: key,
-                is_valid: value,
-            });
-        }
-        
-        Ok(ValidatorInfo {
-            start_block_seqno,
-            block_mask,
-            signatures
-        })
+
+        Ok(Self { signatures })
     }
 }
 
+#[derive(Clone, Debug)]
+struct ValidatorStats {
+    start_block_seqno: u32,
+    blocks_count: usize,
+    self_participation: Vec<bool>,
+    validator_signatures: HashMap<u32, Vec<BlockParticipation>>,
+}
 
 impl ValidatorStats {
-    fn new(start_block: u32, blocks_count: usize) -> anyhow::Result<Self> {
-        let total_bits = blocks_count * 3;
-        let mut builder = CellBuilder::new();
-        let _ = builder.store_u32(start_block)?;
-        for _ in 0..total_bits {
-            builder.store_bit(false)?;
+    fn new(start_block_seqno: u32, blocks_count: usize) -> Self {
+        Self {
+            start_block_seqno,
+            blocks_count,
+            self_participation: vec![false; blocks_count],
+            validator_signatures: HashMap::new(),
         }
-        
-        Ok(Self {
-            blocks_count: blocks_count as u8,
-            cell: builder.build()?,
-        })
     }
 
-    fn update_block_stats(&mut self, block_idx: usize, participation: BlockParticipation) {
-        if block_idx >= self.blocks_count as usize {
+    fn set_self_participation(&mut self, block_idx: usize, participated: bool) {
+        if block_idx < self.blocks_count {
+            self.self_participation[block_idx] = participated;
+        }
+    }
+
+    fn update_validator_signature(&mut self, validator_id: u32, block_idx: usize, participation: BlockParticipation) {
+        if block_idx >= self.blocks_count {
             return;
         }
 
-        let total_bits = self.blocks_count * 3;
-        let mut current_bits = Vec::with_capacity(total_bits as usize);
-        let mut slice = self.cell.as_slice().unwrap();
-        for _ in 0..total_bits {
-            current_bits.push(slice.load_bit().unwrap_or(false));
+        let signatures = self.validator_signatures
+            .entry(validator_id)
+            .or_insert_with(|| vec![BlockParticipation::InvalidSignature; self.blocks_count]);
+
+        if block_idx < signatures.len() {
+            signatures[block_idx] = participation;
         }
-
-        let participation_bit_idx = block_idx;
-        let valid_sig_bit_idx = self.blocks_count + block_idx * 2;
-        let invalid_sig_bit_idx = self.blocks_count + block_idx * 2 + 1;
-        let (participated, sig_valid, sig_invalid_or_missing) = participation.to_bits();
-
-        current_bits[participation_bit_idx] = participated;
-        current_bits[valid_sig_bit_idx] = sig_valid;
-        current_bits[invalid_sig_bit_idx] = sig_invalid_or_missing;
-
-        let mut builder = CellBuilder::new();
-        for bit in current_bits {
-            builder.store_bit(bit).unwrap();
-        }
-        self.cell = builder.build().unwrap();
     }
-
-    // fn get_block_stats(&self, block_idx: usize) -> BlockParticipation {
-    //     if block_idx >= self.blocks_count {
-    //         return BlockParticipation::NotParticipated;
-    //     }
-    //
-    //     let mut slice = self.cell.as_slice().unwrap();
-    //     for _ in 0..block_idx {
-    //         let _ = slice.load_bit();
-    //     }
-    //     let participated = slice.load_bit().unwrap_or(false);
-    //
-    //     for _ in (block_idx + 1)..self.blocks_count {
-    //         let _ = slice.load_bit();
-    //     }
-    //     for _ in 0..block_idx {
-    //         let _ = slice.load_bit();
-    //         let _ = slice.load_bit();
-    //     }
-    //
-    //     let sig_valid = slice.load_bit().unwrap_or(false);
-    //     let sig_invalid_or_missing = slice.load_bit().unwrap_or(false);
-    //
-    //     BlockParticipation::from_bits(participated, sig_valid, sig_invalid_or_missing)
-    // }
 }
 
+impl Store for ValidatorStats {
+    fn store_into(&self, builder: &mut CellBuilder, context: &dyn CellContext) -> Result<(), tycho_types::error::Error> {
+        builder.store_u32(self.start_block_seqno)?;
+
+        let participation_count = self.self_participation.len().min(BLOCK_WINDOW as usize);
+
+        for i in 0..participation_count {
+            builder.store_bit(self.self_participation[i])?;
+        }
+
+        for _ in participation_count..BLOCK_WINDOW as usize {
+            builder.store_bit(false)?;
+        }
+
+        let mut signatures_dict = Dict::<u32, ValidatorSignatureData>::new();
+
+        for (validator_id, signatures) in &self.validator_signatures {
+            let sig_data = ValidatorSignatureData {
+                signatures: signatures.clone(),
+            };
+            signatures_dict.set(*validator_id, sig_data)?;
+        }
+
+        signatures_dict.store_into(builder, context)?;
+
+        Ok(())
+    }
+}
+
+impl<'a> Load<'a> for ValidatorStats {
+    fn load_from(slice: &mut CellSlice<'a>) -> Result<Self, tycho_types::error::Error> {
+        let start_block_seqno = slice.load_u32()?;
+
+        let mut self_participation = Vec::with_capacity(BLOCK_WINDOW as usize);
+        for _ in 0..BLOCK_WINDOW {
+            self_participation.push(slice.load_bit()?);
+        }
+
+        let signatures_dict = Dict::<u32, ValidatorSignatureData>::load_from(slice)?;
+
+        let mut validator_signatures = HashMap::new();
+
+        for entry in signatures_dict.iter() {
+            let (validator_id, sig_data) = entry?;
+            validator_signatures.insert(validator_id, sig_data.signatures);
+        }
+
+        Ok(Self {
+            start_block_seqno,
+            blocks_count: BLOCK_WINDOW as usize,
+            self_participation,
+            validator_signatures,
+        })
+    }
+}
 
 struct BlockProducer {
     tx: broadcast::Sender<Block>,
@@ -291,21 +286,26 @@ impl BlockProducer {
 
 struct Validator {
     address: ValidatorAddress,
+    validator_id: u32,
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
-    local_stats: Arc<RwLock<HashMap<ValidatorAddress, ValidatorStats>>>,
+    local_stats: Arc<RwLock<ValidatorStats>>,
+    block_participation: Arc<RwLock<HashMap<u64, bool>>>,
     blocks_to_track: usize,
+    current_block: AtomicU32,
     validator_set: Arc<RwLock<HashMap<ValidatorAddress, Arc<Validator>>>>,
-    stats_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<(ValidatorAddress, HashMap<ValidatorAddress, ValidatorStats>)>>>>,
+    validator_id_map: Arc<RwLock<HashMap<ValidatorAddress, u32>>>,
+    stats_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<(ValidatorAddress, Cell)>>>>,
     behavior_config: ValidatorBehaviorConfig,
     profile: ValidatorProfile,
-    block_participation: Arc<RwLock<HashMap<u64, bool>>>,
 }
 
 impl Validator {
     fn new(
+        validator_id: u32,
         blocks_to_track: usize,
         validator_set: Arc<RwLock<HashMap<ValidatorAddress, Arc<Validator>>>>,
+        validator_id_map: Arc<RwLock<HashMap<ValidatorAddress, u32>>>,
         profile: ValidatorProfile,
     ) -> Self {
         let mut rng = rand::rng();
@@ -315,18 +315,22 @@ impl Validator {
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let verifying_key = signing_key.verifying_key();
 
-        let mut address = HashBytes([0u8; 32]);
-        address.0.copy_from_slice(verifying_key.as_bytes());
+        let address = HashBytes::from_slice(verifying_key.as_bytes());
 
         let behavior_config = profile.to_behavior_config();
+        let current_block = 0;
+        let local_stats = ValidatorStats::new(current_block, blocks_to_track);
 
         Self {
             address,
+            validator_id,
             signing_key,
             verifying_key,
-            local_stats: Arc::new(RwLock::new(HashMap::new())),
+            local_stats: Arc::new(RwLock::new(local_stats)),
             blocks_to_track,
+            current_block: AtomicU32::new(current_block),
             validator_set,
+            validator_id_map,
             stats_sender: Arc::new(Mutex::new(None)),
             behavior_config,
             profile,
@@ -342,7 +346,7 @@ impl Validator {
         })
     }
 
-    async fn set_stats_sender(&self, sender: tokio::sync::mpsc::Sender<(ValidatorAddress, HashMap<ValidatorAddress, ValidatorStats>)>) {
+    async fn set_stats_sender(&self, sender: tokio::sync::mpsc::Sender<(ValidatorAddress, Cell)>) {
         *self.stats_sender.lock().await = Some(sender);
     }
 
@@ -411,9 +415,14 @@ impl Validator {
         signatures
     }
 
-    async fn update_local_stats(&self, block_idx: usize, signatures: &[BlockSignature]) {
+    async fn update_local_stats(&self, block_idx: usize, signatures: &[BlockSignature], self_participated: bool) -> anyhow::Result<()> {
         let mut stats = self.local_stats.write().await;
         let registry = self.validator_set.read().await;
+        let id_map = self.validator_id_map.read().await;
+
+        // Обновляем участие самого валидатора
+        stats.set_self_participation(block_idx, self_participated);
+
         let signature_map: HashMap<ValidatorAddress, &BlockSignature> =
             signatures.iter().map(|s| (s.validator, s)).collect();
 
@@ -422,8 +431,10 @@ impl Validator {
                 continue;
             }
 
-            let validator_stats = stats.entry(*validator_addr)
-                .or_insert_with(|| ValidatorStats::new(self.blocks_to_track));
+            let validator_id = match id_map.get(validator_addr) {
+                Some(id) => *id,
+                None => continue,
+            };
 
             let actual_participation = if let Some(sig) = signature_map.get(validator_addr) {
                 if sig.is_valid {
@@ -445,27 +456,35 @@ impl Validator {
                 actual_participation
             };
 
-            validator_stats.update_block_stats(block_idx, reported_participation);
+            stats.update_validator_signature(validator_id, block_idx, reported_participation);
         }
+
+        Ok(())
     }
 
-    async fn send_stats_to_slasher(&self) {
-        let stats = self.local_stats.read().await.clone();
+    async fn send_stats_to_slasher(&self) -> anyhow::Result<()> {
+        let stats = self.local_stats.read().await;
+        let mut builder = CellBuilder::new();
+        stats.store_into(&mut builder, Cell::empty_context())?;
+        let cell = builder.build()?;
+
         if let Some(sender) = self.stats_sender.lock().await.as_ref() {
-            let _ = sender.send((self.address, stats)).await;
+            let _ = sender.send((self.address, cell)).await;
         }
+        Ok(())
     }
 
-    async fn run(self: Arc<Self>, mut block_rx: broadcast::Receiver<Block>) {
+    async fn run(self: Arc<Self>, mut block_rx: broadcast::Receiver<Block>) -> Result<()> {
         loop {
             match block_rx.recv().await {
                 Ok(block) => {
                     let block_idx = block.seqno as usize;
-                    let signaturesя = self.collect_signatures(&block).await;
-                    self.update_local_stats(block_idx, &signatures).await;
+                    let self_participated = self.decide_participation(block.seqno).await;
+                    let signatures = self.collect_signatures(&block).await;
+                    self.update_local_stats(block_idx, &signatures, self_participated).await?;
 
                     if block_idx == self.blocks_to_track - 1 {
-                        self.send_stats_to_slasher().await;
+                        let _ = self.send_stats_to_slasher().await;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -473,21 +492,27 @@ impl Validator {
             }
         }
         drop(self.stats_sender.lock().await.take());
+        Ok(())
     }
+}
+
+struct PunishResult {
+    decision: bool,
+    weight: i32,
 }
 
 struct Slasher {
     validator_set: HashMap<u32, ValidatorAddress>,
-    votes: Arc<Mutex<HashMap<ValidatorAddress, HashMap<ValidatorAddress, u8>>>>,
+    votes: Arc<Mutex<HashMap<ValidatorAddress, HashMap<ValidatorAddress, i32>>>>,
     blocks_to_track: usize,
-    stats_receiver: tokio::sync::mpsc::Receiver<(ValidatorAddress, HashMap<ValidatorAddress, ValidatorStats>)>,
+    stats_receiver: tokio::sync::mpsc::Receiver<(ValidatorAddress, Cell)>,
 }
 
 impl Slasher {
     fn new(
         validator_addresses: Vec<ValidatorAddress>,
         blocks_to_track: usize,
-        stats_receiver: tokio::sync::mpsc::Receiver<(ValidatorAddress, HashMap<ValidatorAddress, ValidatorStats>)>,
+        stats_receiver: tokio::sync::mpsc::Receiver<(ValidatorAddress, Cell)>,
     ) -> Self {
         let mut validator_set = HashMap::new();
         for (idx, addr) in validator_addresses.iter().enumerate() {
@@ -502,59 +527,72 @@ impl Slasher {
         }
     }
 
-    async fn receive_stats(&mut self, reporter: ValidatorAddress, stats: HashMap<ValidatorAddress, ValidatorStats>) {
+    async fn receive_stats(&self, reporter: ValidatorAddress, cell: Cell) -> Result<()> {
+        let mut slice = cell.as_slice()?;
+        let stats = ValidatorStats::load_from(&mut slice)?;
+
         let mut votes = self.votes.lock().await;
 
-        for (validator_addr, validator_stats) in stats {
-            if reporter == validator_addr {
+        for (validator_id, signatures) in &stats.validator_signatures {
+            if let Some(validator_addr) = self.validator_set.get(validator_id) {
+                if reporter == *validator_addr {
+                    continue;
+                }
+
+                let weighted_vote = self.should_punish_validator(&stats.self_participation, signatures);
+
+                *votes.entry(reporter)
+                    .or_insert_with(HashMap::new)
+                    .entry(*validator_addr)
+                    .or_insert(0) += weighted_vote;
+            }
+        }
+        Ok(())
+    }
+
+    fn should_punish_validator(&self, reporter_participation: &[bool], signatures: &[BlockParticipation]) -> i32 {
+        let mut skipped_blocks = 0;
+        let mut invalid_signatures = 0;
+        let mut total_blocks = 0;
+
+        for (participated, signature) in reporter_participation.iter().zip(signatures.iter()) {
+            if !participated {
                 continue;
             }
 
-            if let Ok(true) = self.should_punish_validator(&validator_stats) {
-                *votes.entry(reporter)
-                    .or_insert_with(HashMap::new)
-                    .entry(validator_addr)
-                    .or_insert(0) += 1;
+            total_blocks += 1;
+
+            match signature {
+                BlockParticipation::InvalidSignature => invalid_signatures += 1,
+                BlockParticipation::NotParticipated => skipped_blocks += 1,
+                _ => ()
             }
+        }
+
+        if total_blocks == 0 {
+            return 0;
+        }
+
+        let weight = (FIXED_POINT_ONE as usize * total_blocks) / self.blocks_to_track;
+
+        let threshold_percentage = 50;
+
+        let skip_percentage = (skipped_blocks * 100) / total_blocks;
+        let invalid_percentage = (invalid_signatures * 100) / total_blocks;
+
+        if skip_percentage > threshold_percentage || invalid_percentage > threshold_percentage {
+            weight as i32
+        } else {
+            -(weight as i32)
         }
     }
-
-    fn should_punish_validator(&self, stats: &ValidatorStats) -> anyhow::Result<bool> {
-        let mut skipped_blocks = 0;
-        let mut invalid_signatures = 0;
-
-        let mut slice = stats.cell.as_slice()?;
-        for _ in 0..self.blocks_to_track {
-            let participated = slice.load_bit()?;
-            if !participated {
-                skipped_blocks += 1;
-            }
-        }
-
-        for _ in 0..self.blocks_to_track {
-            let _ = slice.load_bit()?;
-            let invalid_or_missing = slice.load_bit()?;
-            if invalid_or_missing {
-                invalid_signatures += 1;
-            }
-        }
-
-        if skipped_blocks * 100 / self.blocks_to_track > 50 {
-            return Ok(true);
-        }
-
-        if invalid_signatures * 100 / self.blocks_to_track > 50 {
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
 
     async fn run(mut self) {
         println!("\nSlasher: Listening for statistics...");
-        while let Some((reporter, stats)) = self.stats_receiver.recv().await {
-            self.receive_stats(reporter, stats).await;
+        while let Some((reporter, cell)) = self.stats_receiver.recv().await {
+            if let Err(e) = self.receive_stats(reporter, cell).await {
+                println!("\nReceive stats error: {}", e);
+            }
         }
         println!("\nSlasher: Generating report...\n");
         self.print_report().await;
@@ -585,7 +623,6 @@ impl Slasher {
         let mut all_validators: Vec<ValidatorAddress> = self.validator_set.values().copied().collect();
         all_validators.sort_by_key(|v| v.0);
 
-
         print!("\n        ");
         for target in &all_validators {
             print!(" {:02x}", target[0]);
@@ -606,10 +643,12 @@ impl Slasher {
                     print!("  -");
                 } else if let Some(reporter_votes) = votes.get(reporter) {
                     if let Some(count) = reporter_votes.get(target) {
-                        if *count > 9 {
-                            print!("  +");
+                        // Показываем реальное значение с учетом знака
+                        let display_value = count >> FIXED_POINT_SHIFT;
+                        if display_value >= 0 {
+                            print!(" {:>3}", display_value);
                         } else {
-                            print!("  {}", count);
+                            print!("{:>4}", display_value);
                         }
                     } else {
                         print!("  .");
@@ -624,29 +663,32 @@ impl Slasher {
         let results = self.calculate_all_metrics().await;
 
         println!("\n\nVALIDATOR PUNISHMENT SUMMARY:");
-        println!("┌──────────────┬───────────────────────────┐");
-        println!("│  Validator   │ Total Votes to Punish     │");
-        println!("├──────────────┼───────────────────────────┤");
+        println!("┌──────────────┬───────────────────────────┬────────────────────────┐");
+        println!("│  Validator   │ Total Votes to Punish     │  Final Score           │");
+        println!("├──────────────┼───────────────────────────┼────────────────────────┤");
 
         for (rank, (validator, vote_count)) in results.iter().enumerate() {
             let validator_short = format!("{:02x}{:02x}...{:02x}{:02x}",
                                           validator[0], validator[1], validator[30], validator[31]);
 
-            println!("│ #{:2} {}│           {:3}             │",
-                     rank + 1, validator_short, vote_count);
-        }
-        println!("└──────────────┴───────────────────────────┘");
+            // Показываем как raw значение, так и в человеко-читаемом формате
+            let display_score = (*vote_count as i32) >> FIXED_POINT_SHIFT;
 
-        let high_votes = results.iter().filter(|(_, count)| *count >= 10).count();
-        let medium_votes = results.iter().filter(|(_, count)| *count >= 5 && *count < 10).count();
-        let low_votes = results.iter().filter(|(_, count)| *count > 0 && *count < 5).count();
+            println!("│ #{:2} {}│      {:10}            │     {:>6}             │",
+                     rank + 1, validator_short, vote_count, display_score);
+        }
+        println!("└──────────────┴───────────────────────────┴────────────────────────┘");
+
+        // Подсчет с учетом знака
+        let positive_votes = results.iter().filter(|(_, count)| *count as i32 > 0).count();
+        let negative_votes = results.iter().filter(|(_, count)| (*count as i32) < 0).count();
+        let neutral_votes = results.iter().filter(|(_, count)| *count == 0).count();
 
         println!("\nVOTE DISTRIBUTION:");
         println!("┌────────────────────────────────────────────┐");
-        println!("│ High (≥10 votes):      {:2} validators     │", high_votes);
-        println!("│ Medium (5-9 votes):    {:2} validators     │", medium_votes);
-        println!("│ Low (1-4 votes):       {:2} validators     │", low_votes);
-        println!("│ Clean (0 votes):       {:2} validators     │", all_validators.len() - results.len());
+        println!("│ Should be punished (>0):  {:2} validators  │", positive_votes);
+        println!("│ Should NOT be punished (<0): {:2} validators│", negative_votes);
+        println!("│ Neutral (=0):             {:2} validators  │", neutral_votes);
         println!("└────────────────────────────────────────────┘");
     }
 }
@@ -689,20 +731,26 @@ async fn simulate_slashing_system() {
     let validator_profiles = create_validators(2, 0, 0, 8);
     let num_validators = validator_profiles.len();
 
-
     println!("CONFIGURATION:");
     println!("  Validators: {}", num_validators);
     println!("  Blocks: {}", NUM_BLOCKS);
     println!("  Block interval: {}ms", BLOCK_INTERVAL_MS);
 
     let validator_set = Arc::new(RwLock::new(HashMap::new()));
+    let validator_id_map = Arc::new(RwLock::new(HashMap::new()));
     let (stats_tx, stats_rx) = tokio::sync::mpsc::channel(100);
 
     let mut validators = Vec::new();
     let mut validator_addresses = Vec::new();
 
-    for profile in validator_profiles {
-        let validator = Arc::new(Validator::new(NUM_BLOCKS, Arc::clone(&validator_set), profile));
+    for (idx, profile) in validator_profiles.into_iter().enumerate() {
+        let validator = Arc::new(Validator::new(
+            idx as u32,
+            NUM_BLOCKS,
+            Arc::clone(&validator_set),
+            Arc::clone(&validator_id_map),
+            profile
+        ));
         validator.set_stats_sender(stats_tx.clone()).await;
         validator_addresses.push(validator.address);
         validators.push(validator);
@@ -711,8 +759,10 @@ async fn simulate_slashing_system() {
 
     {
         let mut registry = validator_set.write().await;
+        let mut id_map = validator_id_map.write().await;
         for validator in &validators {
             registry.insert(validator.address, Arc::clone(validator));
+            id_map.insert(validator.address, validator.validator_id);
         }
     }
 
