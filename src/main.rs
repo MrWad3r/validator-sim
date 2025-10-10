@@ -598,19 +598,38 @@ impl Slasher {
         self.print_report().await;
     }
 
-    async fn calculate_all_metrics(&self) -> Vec<(ValidatorAddress, u32)> {
+    async fn calculate_all_metrics(&self) -> Vec<(ValidatorAddress, i32)> {
         let votes = self.votes.lock().await;
-        let mut vote_totals: HashMap<ValidatorAddress, u32> = HashMap::new();
+        let mut vote_totals: HashMap<ValidatorAddress, i32> = HashMap::new();
 
         for (_reporter, targets) in votes.iter() {
             for (target, count) in targets {
-                *vote_totals.entry(*target).or_insert(0) += *count as u32;
+                *vote_totals.entry(*target).or_insert(0) += *count;
             }
         }
 
         let mut results: Vec<_> = vote_totals.into_iter().collect();
         results.sort_by(|a, b| b.1.cmp(&a.1));
         results
+    }
+
+    fn fixed_point_to_string(value: i32) -> String {
+        let integer_part = value >> FIXED_POINT_SHIFT;
+        let fractional_part = value & ((1 << FIXED_POINT_SHIFT) - 1);
+
+        // Преобразуем fractional часть в проценты (0-99)
+        let fraction_display = (fractional_part as u64 * 100) >> FIXED_POINT_SHIFT;
+
+        if value >= 0 {
+            format!("{}.{:02}", integer_part, fraction_display)
+        } else {
+            // Для отрицательных чисел нужно правильно обработать дробную часть
+            let abs_value = value.abs();
+            let abs_integer = abs_value >> FIXED_POINT_SHIFT;
+            let abs_fractional = abs_value & ((1 << FIXED_POINT_SHIFT) - 1);
+            let abs_fraction_display = (abs_fractional as u64 * 100) >> FIXED_POINT_SHIFT;
+            format!("-{}.{:02}", abs_integer, abs_fraction_display)
+        }
     }
 
     async fn print_report(&self) {
@@ -625,13 +644,13 @@ impl Slasher {
 
         print!("\n        ");
         for target in &all_validators {
-            print!(" {:02x}", target[0]);
+            print!("   {:02x}", target[0]);
         }
         println!();
 
         print!("        ");
         for _ in &all_validators {
-            print!("───");
+            print!("─────");
         }
         println!();
 
@@ -640,21 +659,16 @@ impl Slasher {
 
             for target in &all_validators {
                 if reporter == target {
-                    print!("  -");
+                    print!("    -");
                 } else if let Some(reporter_votes) = votes.get(reporter) {
                     if let Some(count) = reporter_votes.get(target) {
-                        // Показываем реальное значение с учетом знака
-                        let display_value = count >> FIXED_POINT_SHIFT;
-                        if display_value >= 0 {
-                            print!(" {:>3}", display_value);
-                        } else {
-                            print!("{:>4}", display_value);
-                        }
+                        let display = Self::fixed_point_to_string(*count);
+                        print!(" {:>5}", display);
                     } else {
-                        print!("  .");
+                        print!("    .");
                     }
                 } else {
-                    print!("  .");
+                    print!("    .");
                 }
             }
             println!();
@@ -664,24 +678,22 @@ impl Slasher {
 
         println!("\n\nVALIDATOR PUNISHMENT SUMMARY:");
         println!("┌──────────────┬───────────────────────────┬────────────────────────┐");
-        println!("│  Validator   │ Total Votes to Punish     │  Final Score           │");
+        println!("│  Validator   │ Total Votes (raw)         │  Score (decimal)       │");
         println!("├──────────────┼───────────────────────────┼────────────────────────┤");
 
         for (rank, (validator, vote_count)) in results.iter().enumerate() {
             let validator_short = format!("{:02x}{:02x}...{:02x}{:02x}",
                                           validator[0], validator[1], validator[30], validator[31]);
 
-            // Показываем как raw значение, так и в человеко-читаемом формате
-            let display_score = (*vote_count as i32) >> FIXED_POINT_SHIFT;
+            let display_score = Self::fixed_point_to_string(*vote_count);
 
-            println!("│ #{:2} {}│      {:10}            │     {:>6}             │",
+            println!("│ #{:2} {}│      {:10}            │     {:>8}           │",
                      rank + 1, validator_short, vote_count, display_score);
         }
         println!("└──────────────┴───────────────────────────┴────────────────────────┘");
 
-        // Подсчет с учетом знака
-        let positive_votes = results.iter().filter(|(_, count)| *count as i32 > 0).count();
-        let negative_votes = results.iter().filter(|(_, count)| (*count as i32) < 0).count();
+        let positive_votes = results.iter().filter(|(_, count)| *count > 0).count();
+        let negative_votes = results.iter().filter(|(_, count)| *count < 0).count();
         let neutral_votes = results.iter().filter(|(_, count)| *count == 0).count();
 
         println!("\nVOTE DISTRIBUTION:");
@@ -728,7 +740,7 @@ async fn simulate_slashing_system() {
     const NUM_BLOCKS: usize = 10;
     const BLOCK_INTERVAL_MS: u64 = 50;
 
-    let validator_profiles = create_validators(2, 0, 0, 8);
+    let validator_profiles = create_validators(0, 5, 5, 0);
     let num_validators = validator_profiles.len();
 
     println!("CONFIGURATION:");
